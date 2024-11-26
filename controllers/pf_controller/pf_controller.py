@@ -147,6 +147,49 @@ def get_odometry(last_pose, curr_pose):
 
     return [delta_rot1, delta_rot2, delta_trans]
 
+# New odometry model
+def get_odometry_from_encoders(leftSensor, rightSensor, last_left_enc, last_right_enc):
+    """
+    Calculate odometry from wheel encoder readings.
+
+    Args:
+        leftSensor (Device): Left wheel encoder sensor.
+        rightSensor (Device): Right wheel encoder sensor.
+        last_left_enc (float): Previous left wheel encoder value.
+        last_right_enc (float): Previous right wheel encoder value.
+
+    Returns:
+        list: [delta_rot1, delta_rot2, delta_trans]
+        float: Current left encoder value.
+        float: Current right encoder value.
+    """
+    # Robot parameters
+    wheel_radius = 0.195 / 2.0  # Radius in meters
+    wheel_base = 0.34          # Distance between wheels (meters)
+
+    # Current encoder readings
+    curr_left_enc = leftSensor.getValue()
+    curr_right_enc = rightSensor.getValue()
+
+    # Calculate change in encoder values
+    delta_left = curr_left_enc - last_left_enc
+    delta_right = curr_right_enc - last_right_enc
+
+    # Calculate distance traveled by each wheel
+    d_left = wheel_radius * delta_left
+    d_right = wheel_radius * delta_right
+
+    # Compute translational and rotational motion
+    delta_trans = (d_left + d_right) / 2.0  # Average distance
+    delta_rot = (d_right - d_left) / wheel_base  # Rotation
+
+    # Split rotation into two parts (before and after translation)
+    delta_rot1 = delta_rot / 2.0
+    delta_rot2 = delta_rot / 2.0
+
+    return [delta_rot1, delta_rot2, delta_trans], curr_left_enc, curr_right_enc
+
+
 
 #################################### SENSOR MODEL ############################################
 
@@ -205,7 +248,48 @@ def distance_to_closest_circle(x, y, theta, circles):
 # the angle theta to the positive x-axis.
 # The borders are given by map_limits = [x_min, x_max, y_min, y_max].
 def distance_to_closest_border(x, y, theta, map_limits):
-    return float('inf')
+    # Extract map limits
+    x_min, x_max, y_min, y_max = map_limits
+
+    # Initialize list to store distances
+    distances = []
+
+    # Avoid division by zero by handling special cases
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+
+    # Check vertical borders (x = x_min and x = x_max)
+    if not np.isclose(cos_theta, 0):  # Ensure beam is not parallel to vertical borders
+        t_min_x = (x_min - x) / cos_theta  # Distance to left border
+        t_max_x = (x_max - x) / cos_theta  # Distance to right border
+
+        if t_min_x > 0:  # Forward direction only
+            y_at_min_x = y + t_min_x * sin_theta
+            if y_min <= y_at_min_x <= y_max:  # Check if within y bounds
+                distances.append(t_min_x)
+
+        if t_max_x > 0:  # Forward direction only
+            y_at_max_x = y + t_max_x * sin_theta
+            if y_min <= y_at_max_x <= y_max:  # Check if within y bounds
+                distances.append(t_max_x)
+
+    # Check horizontal borders (y = y_min and y = y_max)
+    if not np.isclose(sin_theta, 0):  # Ensure beam is not parallel to horizontal borders
+        t_min_y = (y_min - y) / sin_theta  # Distance to bottom border
+        t_max_y = (y_max - y) / sin_theta  # Distance to top border
+
+        if t_min_y > 0:  # Forward direction only
+            x_at_min_y = x + t_min_y * cos_theta
+            if x_min <= x_at_min_y <= x_max:  # Check if within x bounds
+                distances.append(t_min_y)
+
+        if t_max_y > 0:  # Forward direction only
+            x_at_max_y = x + t_max_y * cos_theta
+            if x_min <= x_at_max_y <= x_max:  # Check if within x bounds
+                distances.append(t_max_y)
+
+    # Return the shortest valid distance, or infinity if no valid distance
+    return min(distances) if distances else float('inf')
 
 
 # Returns the expected range measurements for all beams
@@ -213,11 +297,15 @@ def distance_to_closest_border(x, y, theta, map_limits):
 # and the map, described by circles and map_limits
 def get_z_exp(x, y, theta_rob, n_beams, z_max, circles, map_limits):
     beam_directions = norm_angle_arr(np.linspace(-np.pi/2, np.pi/2, n_beams) + theta_rob)
+    print("beam directions", beam_directions)
     z_exp = []
     for theta in beam_directions:
         dist = distance_to_closest_circle(x, y, theta, circles)
+        print("the distance to closest circle is:", dist)
         if (dist > z_max):
+            print("the z_max is:", z_max)
             dist = distance_to_closest_border(x, y, theta, map_limits)
+            print("the distance to closest border is:", dist)
         z_exp.append(dist)
     return z_exp
     
@@ -243,6 +331,7 @@ def beam_based_model(z_scan, z_scan_exp, b, z_max):
 
 def eval_sensor_model(scan, particles, obstacles, map_limits):
     n_beams = len(scan)
+    print("beams: ", n_beams)
     z_max = 10.0
     std_dev = 1.2
     var = std_dev**2
@@ -327,9 +416,44 @@ def initialize_particles(num_particles, map_limits):
 # The weight of a new particle is the same as the weight from which
 # it was sampled.
 def resample_particles(particles, weights):
-    # replace with your code
-    new_particles = particles
-    new_weights = weights
+    """
+    Resample particles based on their weights using systematic resampling.
+
+    Args:
+        particles (list): List of particles to be resampled.
+        weights (list or np.ndarray): Normalized weights corresponding to the particles.
+
+    Returns:
+        list: Resampled particles.
+    """
+    # Ensure weights are normalized
+    weights = np.array(weights)
+    weights = weights / np.sum(weights)
+    
+    # Compute cumulative weights
+    cumulative_weights = np.cumsum(weights)
+    
+    # Number of particles
+    n_particles = len(particles)
+    
+    # Step size and initial random offset
+    step = 1 / n_particles
+    u = np.random.uniform(0, step)
+    
+    # Indices for the new particles
+    new_particles = []
+    new_weights = []
+    i = 0  # Pointer to the cumulative weights
+    j = 0  # Counter for thresholds
+    
+    # Systematically select particles using while loop
+    while j < n_particles:
+        threshold = u + j * step
+        while threshold > cumulative_weights[i]:
+            i += 1
+        new_particles.append(particles[i])  # Resample the particle
+        new_weights.append(weights[i])     # Keep the same weight
+        j += 1  # Move to the next threshold
 
     return new_particles, new_weights
 
@@ -338,8 +462,37 @@ def resample_particles(particles, weights):
 # with randomly sampled ones.
 # Returns the new set of particles
 def add_random_particles(particles, weights, map_limits):
-    # your code here
-    return particles
+    """
+    Replaces half of the particles with the lowest weights
+    with randomly sampled particles within the map limits.
+
+    Args:
+        particles (list of lists): Current particle set [[x, y, theta], ...].
+        weights (list of floats): Normalized weights for the particles.
+        map_limits (list): [x_min, x_max, y_min, y_max]
+
+    Returns:
+        list: Updated set of particles.
+    """
+    # Number of particles to replace
+    num_particles = len(particles)
+    num_to_replace = num_particles // 2
+
+    # Sort particles and weights by weight (ascending order)
+    sorted_indices = np.argsort(weights)
+    particles = np.array(particles)
+    
+    # Get indices of particles to keep
+    indices_to_keep = sorted_indices[num_to_replace:]
+    
+    # Keep the top half particles
+    new_particles = particles[indices_to_keep].tolist()
+
+    # Add randomly sampled particles
+    for _ in range(num_to_replace):
+        new_particles.append(sample_random_particle(map_limits))
+
+    return new_particles
 
 
 ###########################################main################################
@@ -408,7 +561,7 @@ def main():
     # last pose used for odometry calculations
     last_pose = get_curr_pose(trans_field, rot_field)
     # translation threshold for odometry calculation
-    trans_thr = 0.1
+    trans_thr = 1
 
     while robot.step(timestep) != -1:
         # key controls
@@ -426,6 +579,7 @@ def main():
     
         # get current lidar measurements
         scan = lidar.getRangeImage()
+        print("scan resutl" , scan)
         # we use a reversed scan order in the sensor model
         scan.reverse()
 
@@ -434,7 +588,7 @@ def main():
         last_pose = curr_pose
 
         # insert random particles
-        #particles = add_random_particles(particles, weights, map_limits)
+        particles = add_random_particles(particles, weights, map_limits)
 
         # predict particles by sampling from motion model with odometry info
         particles = sample_motion_model(odometry, particles)
